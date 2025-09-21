@@ -9,9 +9,9 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-// Hardcoded receiver VID/PID - update based on your system
-#define RECEIVER_VID 0x046D
-#define RECEIVER_PID 0xC52B
+// Default receiver VID/PID; can be overridden by environment variables
+#define DEFAULT_RECEIVER_VID 0x046D
+#define DEFAULT_RECEIVER_PID 0xC52B
 
 // HID++ report IDs
 #define HIDPP_SHORT_REPORT_ID 0x10
@@ -20,7 +20,7 @@
 // HID++ 2.0 constants
 #define HIDPP_FEATURE_BACKLIGHT2 0x1982
 
-// Short vs Long message sizes (from Solaar/lib/logitech_receiver/base.py)
+// Short vs Long message sizes
 #define HIDPP_SHORT_PAYLOAD_SIZE 6   // bytes after report id and device index
 #define HIDPP_LONG_PAYLOAD_SIZE  18  // bytes after report id and device index
 
@@ -31,6 +31,28 @@ static void flush_input(hid_device *dev) {
     hid_set_nonblocking(dev, 1);
     while (hid_read(dev, tmp, sizeof(tmp)) > 0) { /* discard */ }
     hid_set_nonblocking(dev, 0);
+}
+
+// Read receiver VID/PID from environment, falling back to defaults.
+// Accepts decimal (e.g., 1133) or hex (e.g., 0x046D, 046D) strings.
+static void get_receiver_ids(uint16_t *vid_out, uint16_t *pid_out) {
+    const char *vid_env = getenv("MX_KEYS_RECEIVER_VID");
+    const char *pid_env = getenv("MX_KEYS_RECEIVER_PID");
+
+    uint16_t vid = DEFAULT_RECEIVER_VID;
+    uint16_t pid = DEFAULT_RECEIVER_PID;
+
+    if (vid_env && *vid_env) {
+        unsigned long v = strtoul(vid_env, NULL, 0);
+        if (v <= 0xFFFFUL) vid = (uint16_t)v;
+    }
+    if (pid_env && *pid_env) {
+        unsigned long p = strtoul(pid_env, NULL, 0);
+        if (p <= 0xFFFFUL) pid = (uint16_t)p;
+    }
+
+    *vid_out = vid;
+    *pid_out = pid;
 }
 
 // Send a HID++ long request and wait for the matching reply for the dev_index and request_id
@@ -74,12 +96,19 @@ static const char *cache_path_file() {
     static char path[512];
     const char *home = getenv("HOME");
     if (!home) home = ".";
-    snprintf(path, sizeof(path), "%s/.mx-keys-backlight-cli.cache", home);
+    // Store cache under the app dir, not in bin
+    snprintf(path, sizeof(path), "%s/.mx-keys-cli/cache", home);
     return path;
 }
 
 static int save_cache(const char *hid_path, int slot, int feat_idx) {
     const char *p = cache_path_file();
+    // Ensure directory exists
+    char dir[512];
+    strncpy(dir, p, sizeof(dir) - 1);
+    dir[sizeof(dir) - 1] = '\0';
+    char *slash = strrchr(dir, '/');
+    if (slash) { *slash = '\0'; mkdir(dir, 0700); }
     FILE *f = fopen(p, "w");
     if (!f) {
         fprintf(stderr, "Failed to write cache %s: %s\n", p, strerror(errno));
@@ -141,17 +170,17 @@ static int backlight2_read(hid_device *dev, uint8_t dev_index, int feat_idx, uin
 // Perform BACKLIGHT2 0x10 write with the 10-byte payload
 static int backlight2_write(hid_device *dev, uint8_t dev_index, int feat_idx,
     uint8_t enabled, uint8_t options, uint8_t effect, uint8_t level, uint16_t dho, uint16_t dhi, uint16_t dpow) {
-	uint8_t payload[10];
-	payload[0] = enabled;           // 0x00/0x01 (Solaar uses non-0xFF for enabled)
-	payload[1] = options;           // lower 3 bits preserved; mode in bits 3..4
-	payload[2] = effect;            // 0xFF = no change
-	payload[3] = level;             // only used if mode==manual
-	payload[4] = (uint8_t)(dho & 0xFF);
-	payload[5] = (uint8_t)((dho >> 8) & 0xFF);
-	payload[6] = (uint8_t)(dhi & 0xFF);
-	payload[7] = (uint8_t)((dhi >> 8) & 0xFF);
-	payload[8] = (uint8_t)(dpow & 0xFF);
-	payload[9] = (uint8_t)((dpow >> 8) & 0xFF);
+    uint8_t payload[10];
+    payload[0] = enabled;           // 0x00/0x01 (non-0xFF indicates enabled)
+    payload[1] = options;           // lower 3 bits preserved; mode in bits 3..4
+    payload[2] = effect;            // 0xFF = no change
+    payload[3] = level;             // only used if mode==manual
+    payload[4] = (uint8_t)(dho & 0xFF);
+    payload[5] = (uint8_t)((dho >> 8) & 0xFF);
+    payload[6] = (uint8_t)(dhi & 0xFF);
+    payload[7] = (uint8_t)((dhi >> 8) & 0xFF);
+    payload[8] = (uint8_t)(dpow & 0xFF);
+    payload[9] = (uint8_t)((dpow >> 8) & 0xFF);
 
     uint16_t request_id = (uint16_t)(((uint16_t)feat_idx << 8) | 0x10);
     request_id = (uint16_t)((request_id & 0xFFF0) | 0x0F);
@@ -214,14 +243,40 @@ static int apply_off(hid_device *dev, uint8_t slot, int feat_idx) {
     return verify[0] == 0 ? 0 : -1; // enabled flag must be zero
 }
 
+// Apply FORCE-ON: send OFF then immediately ON within the same session to refresh timer
+static int apply_force_on(hid_device *dev, uint8_t slot, int feat_idx) {
+    uint8_t state[12];
+    if (backlight2_read(dev, slot, feat_idx, state) != 0) return -1;
+
+    uint8_t options = state[1];
+    uint16_t dho = (uint16_t)(state[6] | (state[7] << 8));
+    uint16_t dhi = (uint16_t)(state[8] | (state[9] << 8));
+    uint16_t dpow = (uint16_t)(state[10] | (state[11] << 8));
+
+    int max = backlight2_get_level_max(dev, slot, feat_idx);
+    int level = (max > 0 ? max - 1 : 0x0F);
+
+    // OFF (ignore failure)
+    (void)backlight2_write(dev, slot, feat_idx, 0x00, options, 0xFF, 0x00, dho, dhi, dpow);
+
+    // ON immediately (basic/auto mode)
+    uint8_t mode = 0x00;
+    uint8_t on_options = (uint8_t)((options & 0x07) | (mode << 3));
+    int wr = backlight2_write(dev, slot, feat_idx, 0x01, on_options, 0xFF, (uint8_t)level, dho, dhi, dpow);
+    if (wr != 0) return -1;
+
+    return 0;
+}
+
 static void usage(const char *prog) {
     fprintf(stderr, "Usage:\n");
     fprintf(stderr, "  %s on\n", prog);
     fprintf(stderr, "  %s off\n", prog);
+    fprintf(stderr, "  %s force-on\n", prog);
 }
 
-static hid_device *open_receiver_and_resolve(int *out_slot, int *out_feat_idx, char *out_path, size_t out_path_cap) {
-    struct hid_device_info *devs = hid_enumerate(RECEIVER_VID, RECEIVER_PID);
+static hid_device *open_receiver_and_resolve(uint16_t vid, uint16_t pid, int *out_slot, int *out_feat_idx, char *out_path, size_t out_path_cap) {
+    struct hid_device_info *devs = hid_enumerate(vid, pid);
     struct hid_device_info *cur = devs;
     hid_device *best = NULL;
     *out_slot = -1;
@@ -261,10 +316,10 @@ int main(int argc, char **argv) {
     if (argc < 2) { usage(argv[0]); return 1; }
     const char *cmd = argv[1];
 
-	if (hid_init() != 0) {
-		fprintf(stderr, "hid_init failed\n");
-		return 1;
-	}
+    if (hid_init() != 0) {
+        fprintf(stderr, "hid_init failed\n");
+        return 1;
+    }
 
     int found_idx = -1;
     int feat_idx = -1;
@@ -283,32 +338,22 @@ int main(int argc, char **argv) {
                     save_cache(cached_path, found_idx, feat_idx);
                 }
             } else {
-                // Try other slots on this same receiver path
-                int new_slot = -1, new_idx = -1;
-                for (uint8_t s = 1; s <= 6; ++s) {
-                    int idx = resolve_feature_index(dev, s, HIDPP_FEATURE_BACKLIGHT2);
-                    if (idx >= 0) { new_slot = s; new_idx = idx; break; }
-                }
-                if (new_slot >= 0) {
-                    found_idx = new_slot;
-                    feat_idx = new_idx;
-                    save_cache(cached_path, found_idx, feat_idx);
-                } else {
-                    // Not on this receiver; clear and force full re-enumeration
-                    hid_close(dev);
-                    dev = NULL;
-                    clear_cache();
-                }
+                // Cached slot no longer exposes BACKLIGHT2: clear and re-enumerate later
+                hid_close(dev);
+                dev = NULL;
+                clear_cache();
             }
         }
     }
     char chosen_path[1024] = {0};
+    uint16_t used_vid = 0, used_pid = 0;
+    get_receiver_ids(&used_vid, &used_pid);
     if (!dev) {
         found_idx = -1;
         feat_idx = -1;
-        dev = open_receiver_and_resolve(&found_idx, &feat_idx, chosen_path, sizeof(chosen_path));
+        dev = open_receiver_and_resolve(used_vid, used_pid, &found_idx, &feat_idx, chosen_path, sizeof(chosen_path));
         if (found_idx < 0 || !dev) {
-            fprintf(stderr, "Error: could not open receiver %04x:%04x or find BACKLIGHT2.\n", RECEIVER_VID, RECEIVER_PID);
+            fprintf(stderr, "Error: could not open receiver %04x:%04x or find BACKLIGHT2.\n", used_vid, used_pid);
             if (dev) hid_close(dev);
             hid_exit();
             return 1;
@@ -320,7 +365,7 @@ int main(int argc, char **argv) {
         if (backlight2_read(dev, (uint8_t)found_idx, feat_idx, probe) != 0) {
             hid_close(dev);
             clear_cache();
-            dev = open_receiver_and_resolve(&found_idx, &feat_idx, chosen_path, sizeof(chosen_path));
+            dev = open_receiver_and_resolve(used_vid, used_pid, &found_idx, &feat_idx, chosen_path, sizeof(chosen_path));
             if (found_idx < 0 || !dev) {
                 fprintf(stderr, "Error: device cache invalid and re-discovery failed.\n");
                 if (dev) hid_close(dev);
@@ -343,20 +388,25 @@ int main(int argc, char **argv) {
         if (rc == 0) {
             printf("Backlight disabled.\n");
         }
+    } else if (strcmp(cmd, "force-on") == 0) {
+        rc = apply_force_on(dev, (uint8_t)found_idx, feat_idx);
+        if (rc == 0) {
+            printf("Backlight forced on.\n");
+        }
     } else {
-		usage(argv[0]);
-		hid_close(dev);
-		hid_exit();
-		return 1;
-	}
+        usage(argv[0]);
+        hid_close(dev);
+        hid_exit();
+        return 1;
+    }
 
-	if (rc != 0) {
+    if (rc != 0) {
         // Command did not verify on cached target. Re-enumerate and retry once.
         clear_cache();
         hid_close(dev);
         found_idx = -1;
         feat_idx = -1;
-        dev = open_receiver_and_resolve(&found_idx, &feat_idx, chosen_path, sizeof(chosen_path));
+        dev = open_receiver_and_resolve(used_vid, used_pid, &found_idx, &feat_idx, chosen_path, sizeof(chosen_path));
         if (!dev || found_idx < 0) {
             fprintf(stderr, "Error: target not found after cache invalidation.\n");
             if (dev) hid_close(dev);
@@ -364,19 +414,22 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (strcmp(cmd, "on") == 0) rc = apply_on(dev, (uint8_t)found_idx, feat_idx);
-        else rc = apply_off(dev, (uint8_t)found_idx, feat_idx);
+        else if (strcmp(cmd, "off") == 0) rc = apply_off(dev, (uint8_t)found_idx, feat_idx);
+        else rc = apply_force_on(dev, (uint8_t)found_idx, feat_idx);
         if (rc == 0) {
             if (chosen_path[0]) save_cache(chosen_path, found_idx, feat_idx);
-            if (strcmp(cmd, "on") == 0) printf("Backlight enabled.\n"); else printf("Backlight disabled.\n");
+            if (strcmp(cmd, "on") == 0) printf("Backlight enabled.\n");
+            else if (strcmp(cmd, "off") == 0) printf("Backlight disabled.\n");
+            else printf("Backlight forced on.\n");
         } else {
             fprintf(stderr, "Error: command did not take effect.\n");
             hid_close(dev);
             hid_exit();
             return 1;
         }
-	}
+    }
 
-	hid_close(dev);
-	hid_exit();
-	return 0;
+    hid_close(dev);
+    hid_exit();
+    return 0;
 }
